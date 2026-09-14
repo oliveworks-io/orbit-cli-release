@@ -1,0 +1,89 @@
+# GHCR 패키지를 **이 저장소 소유로** 한 번 만든다. 일회성이다.
+#
+# 왜 필요한가:
+#   GHCR 패키지의 가시성은 **처음 만든 워크플로가 속한 저장소**를 따라간다.
+#   orbit-cli 는 private 이라 거기서 밀면 패키지가 private 으로 생기고, 그러면
+#   CI 연동 가이드가 안내하는 익명 pull 이 성립하지 않는다. 라벨
+#   (org.opencontainers.image.source)로는 바뀌지 않는다는 것을 실측 2회로 확인했다.
+#
+#   이 저장소는 public 이다. 여기서 먼저 만들어 두면 패키지가 public 으로 생기고,
+#   **가시성은 패키지 단위 설정이라 이후 push 에 유지된다.** 그 뒤로는 orbit-cli 가
+#   같은 패키지에 버전만 추가한다.
+#
+# 올리는 것은 **자리표시용 임시 이미지**다. 실제 CLI 가 아니다.
+# 확인이 끝나면 bootstrap 태그의 버전은 지운다.
+#
+# 실행: Actions → Bootstrap package → Run workflow
+#
+# 끝나고 확인할 것:
+#   · 조직 Packages 에 orbit-cli 가 public 으로 보이는지
+#   · 익명으로 받아지는지
+#       docker logout ghcr.io
+#       docker manifest inspect ghcr.io/oliveworks-io/orbit-cli:bootstrap
+
+name: Bootstrap package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # **실제 이미지와 같은 이름이어야 한다.** 다른 이름으로 만들면 그 패키지만
+  # public 이 되고, 정작 쓸 orbit-cli 는 orbit-cli 저장소가 만들면서 private 이 된다.
+  PACKAGE: ghcr.io/${{ github.repository_owner }}/orbit-cli
+  PLACEHOLDER_TAG: bootstrap
+
+jobs:
+  bootstrap:
+    name: Create package as public
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse if the package already exists
+        run: |
+          set -euo pipefail
+          # 이미 있으면 가시성이 정해진 뒤다 — 여기서 밀어도 바뀌지 않는다.
+          # 그 상태로 성공처럼 끝나면 원인을 엉뚱한 데서 찾게 된다.
+          RAW="$(curl -s "https://ghcr.io/token?scope=repository:${{ github.repository_owner }}/orbit-cli:pull")"
+          if printf '%s' "$RAW" | grep -q '"token"'; then
+            echo "이미 공개 상태로 존재한다 — 이 워크플로는 불필요하다" >&2; exit 1
+          fi
+          if printf '%s' "$RAW" | grep -q 'UNAUTHORIZED'; then
+            echo "패키지가 이미 존재한다(private). **먼저 삭제해야 한다** —" >&2
+            echo "  조직 Packages → orbit-cli → Delete package" >&2
+            exit 1
+          fi
+          echo "패키지 없음 — 새로 만든다"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push placeholder
+        run: |
+          set -euo pipefail
+          # 내용은 중요하지 않다. 패키지를 **존재하게** 만드는 것이 목적이다.
+          # 라벨로 이 저장소를 가리켜 패키지 페이지가 여기에 연결되게 한다.
+          printf '%s\n' \
+            'FROM alpine:3' \
+            'LABEL org.opencontainers.image.source=https://github.com/${{ github.repository }}' \
+            'LABEL org.opencontainers.image.description="placeholder — 실제 CLI 가 아니다. 삭제해도 된다"' \
+            > Dockerfile.bootstrap
+          docker build -f Dockerfile.bootstrap -t "$PACKAGE:$PLACEHOLDER_TAG" .
+          docker push "$PACKAGE:$PLACEHOLDER_TAG"
+          echo "::notice::생성 — $PACKAGE:$PLACEHOLDER_TAG"
+
+      - name: Report visibility
+        run: |
+          set -euo pipefail
+          # 익명으로 조회한다. 토큰이 나오면 public, UNAUTHORIZED 면 private 이다.
+          RAW="$(curl -s "https://ghcr.io/token?scope=repository:${{ github.repository_owner }}/orbit-cli:pull")"
+          if printf '%s' "$RAW" | grep -q '"token"'; then
+            echo "::notice::공개로 생성됐다 — orbit-cli 가 이 패키지에 버전을 추가하면 된다"
+          else
+            echo "::warning::private 으로 생성됐다 — public 저장소에서도 상속되지 않는다. GHCR 경로는 접어야 한다"
+          fi
